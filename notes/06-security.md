@@ -47,7 +47,8 @@ OpenClaw 在 2026 年经历了多次严重安全事件，促使项目从 "轻量
   2. 凭证窃取 (Credential theft)
   3. 输入验证绕过 (Input validation bypass)
   4. 持久控制建立 (Persistent control)
-- **修复**: v2026.5.18 中修复
+- **修复**: ✅ v2026.5.18 中**全部修补确认**
+- **状态**: 已关闭，四个漏洞均已在稳定版中修复
 
 ### ClawHub 投毒
 - **发现者**: Bitdefender Labs
@@ -108,6 +109,45 @@ OpenClaw 在 2026 年经历了多次严重安全事件，促使项目从 "轻量
 5. **改进的安全态势** — 系统性安全增强
 6. **安全路线图** (2026-05-15 发布) — Jesse Merhi 主导
 
+## 新增安全机制 (v2026.5.19-5.20)
+
+### Plaintext Secret Checks (v2026.5.20) 🆕
+
+**问题背景**: Snyk 扫描发现 ClawHub 中约 7.1% 的 Skills（283/4000）存在凭据明文暴露问题 — SKILL.md 指令要求 Agent "使用此 API key"，导致密钥被保存在 LLM 上下文中，可能泄漏给模型提供商或出现在日志明文中。
+
+**v2026.5.20 的修复**:
+- 新增**运行时明文密钥检测** — 自动扫描 SKILL.md 和上下文中的明文凭据
+- 检测到明文密钥时发出警告/拒绝加载
+- 引导使用环境变量或 secret store 替代硬编码
+- 对开发者的影响：SKILL.md 中**不应再硬编码任何 API key、token 或 password**
+
+**正确做法**:
+```markdown
+# SKILL.md (错误 ❌)
+Use API key: sk-xxxxxxxxxxxx
+
+# SKILL.md (正确 ✅)
+Read the API key from environment variable $MY_API_KEY
+```
+
+### Skill 安装信任边界 (v2026.5.19)
+
+- 上传的 zip-backed skill archives 现在需要显式开关: `skills.install.allowUploadedArchives`
+- Symlinked skill targets 保持 opt-in
+- Linked plugin runtime facades 可加载但不削弱默认隔离模型
+
+### Cron Failover 安全分类 (v2026.5.19)
+
+- Cron failover 现在可以**分类结构化的 `server_error` payloads**
+- 根据错误类型决定重试策略（而非盲目重试）
+- 防止因持续重试恶意/损坏的 cron 任务导致资源耗尽
+
+### Runtime 错误处理增强 (v2026.5.19)
+
+- 畸形的 session-kill 路径返回**确定性 400 错误**（而非不可预测的行为）
+- 失败的工具调用在声称成功后会**显示简洁警告**
+- scoped background exec/process 引用在 **compaction 后存活**（不会因上下文压缩丢失正在运行的后台任务引用）
+
 ## 最佳安全实践
 
 ### 部署建议
@@ -133,8 +173,9 @@ openclaw doctor --fix
 ## 问题与思考
 
 - [x] 主要攻击面？→ Exec Policy Engine > Gateway WebSocket > Container Boundary
-- [x] 已知严重漏洞？→ ClawJacked, Claw Chain, ClawHub 投毒, BOOTSTRAP 注入
+- [x] 已知严重漏洞？→ ClawJacked, Claw Chain (已全部修补), ClawHub 投毒, BOOTSTRAP 注入
 - [x] 安全方向？→ 更少 magic, 更清晰边界, 更好扫描
+- [x] 凭据泄漏防护？→ v2026.5.20 plaintext secret checks（自动检测 SKILL.md 中的明文密钥）
 - [ ] Exec Policy Engine 的配置语法？
 - [ ] Container Boundary 的具体技术实现？
 - [ ] 如何监控/审计 Agent 的所有工具调用？
@@ -146,5 +187,6 @@ openclaw doctor --fix
 | 日期 | 内容 | 来源 |
 |------|------|------|
 | 2026-05-20 | 全面更新：安全事件梳理、攻击面分析、加固方向 | arxiv + 新闻 + 官方博客 |
+| 2026-05-22 | 补充：plaintext secret checks、Claw Chain 修补确认、Cron failover 安全分类、Skill 信任边界 | v2026.5.18-5.20 release notes |
 
 ---

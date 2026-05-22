@@ -80,6 +80,9 @@ Agent-Browser 是 OpenClaw 的浏览器自动化工具：
   - 展示 pending/handled 模态对话框
   - `blockedByDialog` 状态
   - 按 dialog id 回答对话框
+- **v2026.5.19+**: 浏览器阻断证明增强 (proof around browser blockers)
+  - 更可靠地检测页面是否被 dialog 阻断
+  - 改进的 action 返回状态
 - **v2026.3.13+**: Chrome DevTools MCP 作为 first-class 驱动
   - 连接已有浏览器 session（含认证 tabs）
 
@@ -144,6 +147,25 @@ openclaw plugins validate
 openclaw plugins publish
 ```
 
+### Plugin 创建优化 (v2026.5.19) 🆕
+
+v2026.5.19 对 Plugin 开发体验进行了优化：
+- **更清晰的创建流程** — `openclaw plugins init` 生成更完整的脚手架
+- **Runtime parity checks** — 构建时检查插件与运行时的一致性，避免发布后才发现不兼容
+- **Preview-passing 容错** — 一个 preview cell 失败不阻塞整个插件发布
+- **发布重试** — ClawHub CLI 依赖安装的临时失败自动重试
+- **版本验证** — 发布后自动验证每个预期的 ClawHub package 版本
+
+### Plugin 发布流程改进
+
+```
+开发 → build → validate → publish
+                  │              │
+                  ▼              ▼
+          runtime parity    版本验证 + 重试
+          checks (新)       (新)
+```
+
 ## MCP (Model Context Protocol) 支持
 
 OpenClaw 兼容 MCP 协议：
@@ -183,7 +205,37 @@ LLM 输出 tool_call
 ### Container Boundary
 - 可选的沙箱隔离
 - 防止工具执行逃逸
-- Claw Chain 漏洞曾突破此边界
+- Claw Chain 漏洞曾突破此边界（已在 v2026.5.18 修补）
+
+### SKILL.md 安全约束 (v2026.5.20) 🆕
+
+**Plaintext Secret Checks** — v2026.5.20 新增运行时明文密钥检测：
+
+| 行为 | 说明 |
+|------|------|
+| 自动扫描 | 加载 SKILL.md 时检测明文凭据 |
+| 拒绝/警告 | 发现明文密钥时拒绝加载或发出警告 |
+| 引导修复 | 提示使用环境变量或 secret store |
+
+**开发者须知** — 编写 SKILL.md 的新规则：
+
+```markdown
+# ❌ 错误：硬编码密钥
+Use this API key: sk-proj-xxxxxxxx
+Pass token ABC123 to the endpoint
+
+# ✅ 正确：引用环境变量
+Read the API key from environment variable $OPENAI_API_KEY
+Use the token stored in $MY_SERVICE_TOKEN
+```
+
+**背景**: Snyk 扫描发现 ClawHub 中约 7.1% 的 Skills 存在凭据明文暴露问题（283/4000 个 Skills），密钥被保存在 LLM 上下文窗口中可能泄漏给模型提供商或出现在日志中。
+
+### Skill 安装信任边界 (v2026.5.19) 🆕
+
+- 上传的 zip-backed skill archives 需要显式开关：`skills.install.allowUploadedArchives`
+- Symlinked skill targets 保持 opt-in（默认不启用）
+- Linked plugin runtime facades 可加载但不削弱默认隔离
 
 ### 权限分级
 - 低风险：文件读取、信息查询
@@ -196,6 +248,7 @@ LLM 输出 tool_call
 - [x] Skill 的格式？→ SKILL.md with YAML frontmatter
 - [x] 如何安装第三方 skill？→ ClawHub + CLI
 - [x] 浏览器自动化方案？→ Agent-Browser (默认) + Chrome DevTools MCP
+- [x] SKILL.md 可以硬编码密钥吗？→ ❌ 不可以，v2026.5.20 会检测并拒绝加载
 - [ ] defineToolPlugin 的完整 TypeScript 类型定义？
 - [ ] Tool 调用的超时配置？
 - [ ] 沙箱的具体技术实现 (Docker? seccomp? chroot?)？
@@ -207,5 +260,6 @@ LLM 输出 tool_call
 | 日期 | 内容 | 来源 |
 |------|------|------|
 | 2026-05-20 | 全面更新: Plugin 系统、Agent-Browser、ClawHub、安全 | 多源 |
+| 2026-05-22 | 补充: Plugin 创建优化 (5.19)、SKILL.md plaintext secret checks (5.20)、浏览器阻断证明增强、Skill 安装信任边界 | v2026.5.19-5.20 release notes |
 
 ---

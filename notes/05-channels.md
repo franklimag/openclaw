@@ -97,11 +97,54 @@ OpenClaw 推荐使用 **BlueBubbles** 作为 iMessage 通道：
 - OpenClaw 通过 BlueBubbles API 收发 iMessage
 - 截至 2026.4，这是官方推荐路径
 
-## Android 实时语音 (v2026.5.18+)
+## 语音能力 (v2026.5.18+)
 
-- 基于 Gateway relay 的实时语音 sessions
-- Android 客户端支持
-- 多模型配置完全解锁
+### Android Realtime Talk Mode
+
+v2026.5.18 引入完整的 Android 实时语音支持：
+
+- **架构**: 通过 Gateway relay 实现语音中继
+- **输入**: 流式麦克风输入 (streamed microphone input)
+- **输出**: 实时音频播放 (real-time audio playback)
+- **模型**: 完全解锁多模型配置（GPT-5 / Opus / Grok）
+- **事件**: Codex-compatible realtime event aliases
+
+### Discord 语音增强 (v2026.5.20)
+
+- **Voice follows users**: 语音会话跟随用户在频道间移动
+- **Speaker-turn diagnostics**: 说话者轮次诊断
+- **Playback reset tracking**: 播放重置追踪
+- **Barge-in analysis**: 打断分析
+- **Audio cutoff investigation**: 音频截断调查
+- **Safer playback queuing**: 更安全的播放队列，适应嘈杂的直播环境
+
+### 语音通道总结
+
+| 平台 | 语音能力 | 版本 |
+|------|----------|------|
+| Android | Realtime Talk Mode (双向流式) | v2026.5.18+ |
+| Discord | Voice follows users + 诊断工具 | v2026.5.20+ |
+| Telegram | 语音消息处理（非实时） | 已有 |
+
+## 近期通道修复 (v2026.5.18-5.20)
+
+### Telegram 增强
+- 媒体文件投递可靠性提升
+- Forum-topic 消息投递修复
+- No-response DM turns 保持静默
+- Partial-stream deltas 不产生重复预览
+- 投递最终确认答案而非重播 pre-tool 文本
+- Select-button callbacks 优先于 raw fallbacks
+
+### xAI/Grok 集成 (v2026.5.18 + 2026-05-22 正式发布)
+
+xAI 于 2026-05-22 正式宣布 Grok 集成 OpenClaw：
+
+- **认证**: SuperGrok 或 X Premium 订阅即可使用
+- **OAuth 修复**: v2026.5.18 修复了 Grok OAuth 认证流程
+- **推理能力**: Grok 支持 `/think` 端点用于推理型任务
+- **覆盖平台**: 通过 OpenClaw 在 WhatsApp、Telegram、Slack、Discord 等平台使用 Grok
+- **配置**: `openclaw models auth login --provider xai`
 
 ## 安全注意
 
@@ -114,7 +157,8 @@ OpenClaw 推荐使用 **BlueBubbles** 作为 iMessage 通道：
 
 - [x] 支持哪些平台？→ 50+ (内置 + 插件)
 - [x] iMessage 如何接入？→ BlueBubbles
-- [x] 有语音支持吗？→ Android 实时语音 (2026.5.18+)
+- [x] 有语音支持吗？→ Android Realtime Talk (5.18+) + Discord voice follows (5.20+)
+- [x] Grok 支持？→ v2026.5.18 OAuth 修复 + 2026-05-22 正式集成
 - [ ] 如何开发自定义 channel adapter 插件？
 - [ ] 跨通道 session 的合并策略？
 - [ ] 各平台的 rate limiting 处理？
@@ -126,5 +170,6 @@ OpenClaw 推荐使用 **BlueBubbles** 作为 iMessage 通道：
 | 日期 | 内容 | 来源 |
 |------|------|------|
 | 2026-05-20 | 全面更新：通道分类、BlueBubbles、Android 语音、插件机制 | 多源 |
+| 2026-05-22 | 补充：Discord 语音增强、Telegram 修复细节、xAI/Grok 正式集成 | v2026.5.18-5.20 release notes |
 
 ---
