@@ -11,7 +11,16 @@ OpenClaw 使用 `YYYY.M.DD` 格式的版本号（如 `2026.5.12`）。
 
 ### 2026.5.x 系列
 
-#### ⭐ 2026.5.20 (May 20, 2026) — 最新版本 🆕
+#### ⭐ 2026.5.22 (May 22, 2026) — 最新版本 🆕
+- **Gateway 性能大提升 (4,100x)**: Model list API 响应从 ~20s 降至 5ms，启动时预热 provider auth 状态，跳过整个 plugin + CLI discovery 链
+- **Channel catalog 复用**: 跨进程复用 channel catalog 读取，减少冗余 I/O
+- **CPU profile 轮转**: 减少高吞吐管道中的资源浪费
+- **Meeting Notes Plugin**: 首个外部 "Meeting Notes" 插件，支持自动会议记录摘要
+- **Grok OAuth token 复用**: 可复用 Grok OAuth token 做 xAI web search
+- **OpenAI image 修复**: 修复 Codex streaming 后 image generation 401 认证失败
+- **200+ 修复和优化**: 全面稳定性提升
+
+#### 2026.5.20 (May 20, 2026)
 - **Discord voice follows users**: Discord 语音现在跟随用户移动
 - **Plaintext secret checks**: 明文密钥检查（安全增强），防止凭据以明文暴露在 SKILL.md 和上下文中
 - **Model status clarification**: 模型状态行为更清晰，改进错误提示
@@ -102,6 +111,7 @@ OpenClaw 使用 `YYYY.M.DD` 格式的版本号（如 `2026.5.12`）。
 | 2026-05-18 | v2026.5.18 — Android 实时语音 + Grok OAuth 修复 + Claw Chain 修补 |
 | 2026-05-19 | v2026.5.19 — 90+ 稳定性修复，运算符级版本 |
 | 2026-05-20 | v2026.5.20 — Discord 语音增强 + 明文密钥检查 + Windows 修复 |
+| 2026-05-22 | v2026.5.22 — Gateway 4,100x 性能提升 + Meeting Notes Plugin + 200 fixes |
 | 2026-05-22 | xAI 宣布 Grok 正式集成 OpenClaw (SuperGrok/X Premium) |
 
 ## 关注的功能方向
@@ -129,4 +139,4 @@ OpenClaw 使用 `YYYY.M.DD` 格式的版本号（如 `2026.5.12`）。
 
 ---
 
-*最后更新: 2026-05-22*
+*最后更新: 2026-05-26*

@@ -65,6 +65,7 @@ environment:
 | Chronix | 定时任务/Cron 调度 | |
 | MCP Tools | Model Context Protocol 工具 | |
 | Codex Tools | workspace/edit/exec | Codex runtime 提供 |
+| Meeting Notes | 自动会议记录摘要 | v2026.5.22 首个外部 Plugin |
 
 ### Agent-Browser 详解
 

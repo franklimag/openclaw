@@ -120,6 +120,38 @@ openclaw sessions list
 - 建议：限制网络暴露，使用 Tailscale 等安全隧道
 - ClawJacked 漏洞即通过 Gateway 接口实现攻击
 
+## 性能优化 (v2026.5.22) 🆕
+
+v2026.5.22 对 Gateway 进行了重大性能优化：
+
+### Model List API: 4,100x 提速
+
+| 指标 | 优化前 | 优化后 |
+|------|--------|--------|
+| Model list 响应时间 | ~20 秒 | 5 毫秒 |
+| 提升倍数 | — | **4,100x** |
+
+**优化策略**:
+- **Pre-warm auth states** — Gateway 启动时预热所有 provider 认证状态
+- **热路径跳过 discovery** — 请求时跳过整个 plugin + CLI discovery 链
+- 这是从"demo 级"到"生产级"的关键基础设施优化
+
+### Channel Catalog 复用
+
+- 跨进程复用 channel catalog 读取结果
+- 避免每个请求重复读取通道配置
+- 显著减少高吞吐场景下的 I/O 开销
+
+### CPU Profile 轮转
+
+- 自动轮转 CPU profile 数据
+- 减少持续 profiling 对正常运行的资源消耗
+- 便于事后诊断性能问题
+
+### 启动时间优化
+
+结合上述优化，Gateway 启动时间和首次响应延迟都大幅改善。
+
 ## 诊断命令
 
 ```bash
@@ -143,5 +175,6 @@ openclaw doctor --fix       # 自动诊断修复
 | 日期 | 内容 | 来源 |
 |------|------|------|
 | 2026-05-20 | 初始化笔记，整理 Gateway 核心职责和技术规格 | 多源搜索 |
+| 2026-05-26 | 新增 v2026.5.22 性能优化：4,100x API 提速、catalog 复用、CPU profile 轮转 | release notes |
 
 ---
