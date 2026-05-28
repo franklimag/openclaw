@@ -54,7 +54,8 @@ Channels (50+) → Gateway (WebSocket:18789) → Agent Runtime (Pi Core) → Age
 │   ├── 05-channels.md         # 消息通道 (50+ 平台/BlueBubbles/Voice)
 │   ├── 06-security.md         # 安全机制 (攻击面/事件/加固)
 │   ├── 07-team-setup.md       # 从零搭建 AI 开发团队 (飞书 Channel)
-│   └── 08-session-mechanism.md # Session 机制深度分析 (源码级，含通信隔离方案)
+│   ├── 08-session-mechanism.md # Session 机制深度分析 (源码级，含通信隔离方案)
+│   └── 09-team-config-analysis.md  # 真实团队配置分析报告
 ├── experiments/               # 实验代码/配置
 └── .kiro/steering/            # Kiro 工作约定
 ```
