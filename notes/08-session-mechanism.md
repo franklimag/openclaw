@@ -917,6 +917,288 @@ function buildSubagentDelegationPreferenceSection(params: {
 - 派发后调用 `sessions_yield` 等待结果
 - 子 agent 完成后以推送方式收到通知
 
+## 十二、历史子 Session 积累与检索问题
+
+### 12.1 问题描述
+
+使用 `sessions_spawn` 派生子 agent 时，随着使用会产生大量历史子 session：
+- 每个任务派发产生至少一个 spawn-child session
+- Session 使用 UUID 作为 sessionId，不具备语义可读性
+- Session store (`sessions.json`) 中的 entry 越来越多
+- 检索特定历史 session 时需要在全部记录中搜索
+
+### 12.2 OpenClaw 的自动治理机制（源码实证）
+
+源码: `src/config/sessions/store-maintenance.ts`
+
+OpenClaw 内建了三层自动治理：
+
+#### 第一层：时间淘汰 (pruneStaleEntries)
+
+```typescript
+const DEFAULT_SESSION_PRUNE_AFTER_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
+
+export function pruneStaleEntries(store, overrideMaxAgeMs?, opts?) {
+  const maxAgeMs = overrideMaxAgeMs ?? resolveMaintenanceConfigFromInput().pruneAfterMs;
+  const cutoffMs = Date.now() - maxAgeMs;
+  for (const [key, entry] of Object.entries(store)) {
+    if (shouldPreserveMaintenanceEntry({ key, entry, preserveKeys })) continue;
+    if (entry?.updatedAt != null && entry.updatedAt < cutoffMs) {
+      delete store[key]; // 超过 30 天的自动删除
+      pruned++;
+    }
+  }
+}
+```
+
+**关键发现**：subagent session 不在 "protected" 列表中：
+
+```typescript
+function isSyntheticSessionMaintenanceKey(sessionKey: string): boolean {
+  return (
+    isSubagentSessionKey(sessionKey) ||  // ← subagent session 是 "synthetic"
+    isAcpSessionKey(sessionKey) ||
+    isCronSessionKey(sessionKey) ||
+    ...
+  );
+}
+
+export function isProtectedSessionMaintenanceEntry(sessionKey, entry): boolean {
+  if (isSyntheticSessionMaintenanceKey(sessionKey)) return false; // ← 不受保护
+  // 只有 group/channel/thread 类型的 session 受保护
+  ...
+}
+```
+
+**结论：subagent (spawn-child) session 会被自动清理，它们不像群组 session 那样被"永久保护"。**
+
+#### 第二层：数量上限 (capEntryCount)
+
+```typescript
+const DEFAULT_SESSION_MAX_ENTRIES = 500;
+
+export function capEntryCount(store, overrideMax?, opts?) {
+  const maxEntries = overrideMax ?? resolveMaintenanceConfigFromInput().maxEntries;
+  // 按 updatedAt 降序排序，只保留最新的 maxEntries 个
+  const sorted = keys.toSorted((a, b) => getEntryUpdatedAt(store[b]) - getEntryUpdatedAt(store[a]));
+  const toRemove = sorted.slice(maxRemovableEntries);
+  for (const key of toRemove) {
+    delete store[key]; // 超出上限的自动删除
+  }
+}
+```
+
+**默认最多保留 500 个 session entry**。超出后按时间排序删除最旧的。
+
+#### 第三层：磁盘预算 (enforceSessionDiskBudget)
+
+源码: `src/config/sessions/disk-budget.ts`
+
+```typescript
+export async function enforceSessionDiskBudget(params: {
+  store: Record<string, SessionEntry>;
+  storePath: string;
+  maintenance: SessionDiskBudgetConfig; // { maxDiskBytes, highWaterBytes }
+  ...
+}): Promise<SessionDiskBudgetSweepResult | null> {
+  // 1. 统计 sessions 目录总大小
+  // 2. 超过 maxDiskBytes 时触发清理
+  // 3. 先删除孤立的 transcript 文件
+  // 4. 如果还超标，从 store 中删除最老的 entry + 对应 transcript
+  // 5. 清理到 highWaterBytes 以下为止
+}
+```
+
+### 12.3 Maintenance 触发时机
+
+源码: `src/config/sessions/store-maintenance.ts`
+
+```typescript
+export function shouldRunSessionEntryMaintenance(params: {
+  entryCount: number;
+  maxEntries: number;
+  force?: boolean;
+}): boolean {
+  if (params.force) return true;
+  // 当 entry 数量达到 maxEntries + slack 时触发 (非每次写入都触发)
+  return params.entryCount >= resolveSessionEntryMaintenanceHighWater(params.maxEntries);
+}
+
+export function resolveSessionEntryMaintenanceHighWater(maxEntries: number): number {
+  // maxEntries <= 49: 立即触发 (maxEntries + 1)
+  // maxEntries > 49:  批量触发 (maxEntries + max(25, 10%))
+  // 例: maxEntries=500 → 高水位=550，达到 550 时一次性清理到 500
+}
+```
+
+**不是每次 spawn 都触发清理**，而是积累到一定阈值后批量清理，减少 I/O 开销。
+
+### 12.4 配置优化建议
+
+```json
+{
+  "session": {
+    "maintenance": {
+      "mode": "enforce",
+      "pruneAfter": "7d",
+      "maxEntries": 200,
+      "maxDiskBytes": "100MB",
+      "resetArchiveRetention": "3d"
+    }
+  }
+}
+```
+
+| 配置项 | 默认值 | 建议值 | 说明 |
+|--------|--------|--------|------|
+| `pruneAfter` | 30d | 7d | 子 session 完成后 7 天即可清除 |
+| `maxEntries` | 500 | 200 | 减少检索范围 |
+| `maxDiskBytes` | 无限制 | 100MB | 磁盘预算，超出自动清理 |
+| `resetArchiveRetention` | 同 pruneAfter | 3d | reset 归档文件保留时间 |
+
+### 12.5 检索优化：避免在全量历史中搜索
+
+#### 方法 1: 使用 `taskName` 创建可预测的 session key
+
+源码: `src/agents/tools/sessions-spawn-tool.ts`
+
+```typescript
+const schema = {
+  task: Type.String(),
+  taskName: Type.Optional(Type.String({
+    description: "stable lowercase identifier for referencing this session later"
+  })),
+  label: Type.Optional(Type.String()),
+  ...
+};
+```
+
+spawn 时指定 `taskName`，session key 变为可预测格式：
+
+```
+sessions_spawn(task="实现登录模块", taskName="login_module")
+→ session key: agent:pm:subagent:login_module
+```
+
+之后可以直接用 key 检索，无需搜索：
+
+```
+sessions_send(sessionKey="agent:pm:subagent:login_module", message="进度如何？")
+```
+
+#### 方法 2: 使用 `label` 进行语义检索
+
+spawn 时设置 `label`，后续通过 `sessions_send(label="登录模块开发")` 查找：
+
+```
+sessions_spawn(task="...", label="登录模块开发-v1")
+```
+
+Gateway 的 `sessions.resolve` 方法支持按 label 查找：
+
+```typescript
+// sessions_send 内部使用:
+const resolved = await callGateway({
+  method: "sessions.resolve",
+  params: { label: labelParam, agentId: requestedAgentId },
+});
+```
+
+#### 方法 3: `sessions_list` 过滤参数
+
+```typescript
+const SessionsListToolSchema = Type.Object({
+  kinds: Type.Optional(Type.Array(Type.String())),  // 过滤类型，如 ["spawn-child"]
+  activeMinutes: Type.Optional(Type.Number()),       // 仅最近 N 分钟活跃的
+  label: Type.Optional(Type.String()),               // 按 label 匹配
+  agentId: Type.Optional(Type.String()),             // 按 agent 过滤
+  search: Type.Optional(Type.String()),              // 文本搜索
+  limit: Type.Optional(Type.Number()),               // 限制返回数量
+});
+```
+
+coordinator 可以精确查询：
+
+```
+sessions_list(kinds=["spawn-child"], activeMinutes=60, limit=10)
+→ 仅返回最近 1 小时内活跃的子 session
+```
+
+#### 方法 4: `spawnedBy` 过滤
+
+`SessionListRow` 包含 `spawnedBy` 字段：
+
+```typescript
+export type SessionListRow = {
+  key: string;
+  spawnedBy?: string;   // ← 可按父 session 过滤
+  label?: string;
+  displayName?: string;
+  status?: SessionRunStatus;
+  ...
+};
+```
+
+### 12.6 Session 生命周期管理策略
+
+针对飞书团队协作场景的推荐生命周期策略：
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Session 生命周期                                               │
+│                                                                  │
+│  spawn (创建)                                                    │
+│    ↓                                                             │
+│  running (执行中) ← sessions_send 交互                          │
+│    ↓                                                             │
+│  done/failed (完成/失败) — status 字段标记                       │
+│    ↓                                                             │
+│  idle (闲置) — updatedAt 不再更新                                │
+│    ↓  (7d 后)                                                    │
+│  pruned (自动清理) — store-maintenance 删除 entry + transcript   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**在 coordinator 的 SOUL.md 中指导**：
+
+```markdown
+## Task Session Management
+
+- Use `taskName` for all spawned sessions: `sessions_spawn(taskName="task_xxx")`
+- Use descriptive `label` for human-readable identification
+- After task completion, record key results to /shared-workspace/tasks/
+- Do NOT repeatedly query completed task sessions; read the task result file instead
+- For active task status, use `sessions_list(kinds=["spawn-child"], activeMinutes=30)`
+```
+
+### 12.7 长期方案：结果持久化而非 Session 持久化
+
+对于已完成的任务，核心问题不是"如何找到历史 session"，而是"如何保留任务结果"：
+
+```
+正确模式:
+  spawn-child session (短期，最终会被清理)
+    ↓ 任务完成时
+  结果写入 /shared-workspace/tasks/TASK-001-result.md (永久保留)
+    ↓ coordinator 汇总
+  用户 session transcript 中记录摘要 (永久保留在用户对话中)
+
+错误模式:
+  依赖历史 spawn-child session 作为任务记录存储
+  (这些 session 30 天后自动被清理)
+```
+
+### 12.8 源码中的保护机制总结
+
+| session 类型 | 是否受 maintenance 保护 | 清理行为 |
+|---|---|---|
+| 群组/频道 session (group/channel) | **受保护** | 不会被 prune 或 cap |
+| Thread session | **受保护** | 不会被 prune 或 cap |
+| Subagent session | 不受保护 | 30 天后 prune，超出 500 cap |
+| ACP session | 不受保护 | 同上 |
+| Cron session | 不受保护 | 同上 |
+| DM (direct) session | 不受保护 | 同上 |
+
 ## 学习记录
 
 | 日期 | 内容 | 来源 |
@@ -925,6 +1207,7 @@ function buildSubagentDelegationPreferenceSection(params: {
 | 2026-05-26 | 诊断 coordinator session 混杂问题，提出三种解决方案 | 源码分析 + 场景推演 |
 | 2026-05-26 | 补充：agent 忙碌时的响应延迟解决方案 (queueMode/yield/lanes) | 源码: queue-policy.ts, lanes.ts, sessions-yield-tool.ts |
 | 2026-05-26 | 补充：上下文层级模型和跨 session 共享机制 | 源码: resource-loader.ts, system-prompt.ts, context-engine/ |
+| 2026-05-26 | 补充：历史子 session 积累问题的自动治理机制和检索优化 | 源码: store-maintenance.ts, disk-budget.ts, sessions-spawn-tool.ts |
 
 ---
 
