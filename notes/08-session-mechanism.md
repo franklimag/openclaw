@@ -491,12 +491,723 @@ export function getSubagentDepth(sessionKey: string | undefined | null): number 
 - [ ] Lane Queue 在多 spawn-child session 并行时的实际行为
 - [ ] `sessions_send` 的 `timeoutSeconds=0` 模式下，如何获知任务最终完成状态
 
+## 十、Agent 忙碌时的响应延迟问题
+
+### 10.1 问题描述
+
+当 coordinator 通过 `sessions_send` 向某个 agent 发送消息时，如果该 agent 正在执行任务（当前有 active run），新消息会进入 Lane Queue 串行等待。这导致：
+- 发起方（coordinator）无法实时了解接收方状态
+- 接收方忙碌时响应延迟不可控
+
+### 10.2 Queue Mode 机制（源码实证）
+
+源码: `src/auto-reply/reply/queue-policy.ts`
+
+OpenClaw 为每个 session 提供了 `queueMode` 配置，决定在 agent 忙碌时如何处理新消息：
+
+```typescript
+// src/config/sessions/types.ts
+queueMode?: "steer" | "followup" | "collect" | "interrupt";
+```
+
+| queueMode | 行为 | 适用场景 |
+|-----------|------|----------|
+| `"steer"` | 新消息作为 steering 注入当前运行中的 turn，**立即可见** | coordinator 需要实时中断子 agent |
+| `"followup"` | 新消息排队等待当前 turn 结束后处理 | 默认行为，安全但有延迟 |
+| `"collect"` | 收集多条消息，合并后在当前 turn 结束后一次性处理 | 高频消息场景，避免消息风暴 |
+| `"interrupt"` | 中断当前 turn，立即处理新消息 | 紧急指令场景 |
+
+源码: `src/auto-reply/reply/queue-policy.ts`
+
+```typescript
+export type ActiveRunQueueAction = "run-now" | "enqueue-followup" | "drop";
+
+export function resolveActiveRunQueueAction(params: {
+  isActive: boolean;
+  isHeartbeat: boolean;
+  shouldFollowup: boolean;
+  queueMode: QueueSettings["mode"];
+  resetTriggered?: boolean;
+}): ActiveRunQueueAction {
+  if (!params.isActive) return "run-now";     // 空闲时直接执行
+  if (params.isHeartbeat) return "drop";       // 心跳消息在忙碌时丢弃
+  if (params.resetTriggered) return "run-now"; // /new 等重置命令立即执行
+  // 忙碌时根据 queueMode 决定
+  ...
+}
+```
+
+### 10.3 `sessions_list` 工具查询 Agent 状态
+
+源码: `src/agents/tools/sessions-list-tool.ts`
+
+coordinator 可以通过 `sessions_list` 工具实时查询其他 agent session 的运行状态：
+
+```typescript
+const SessionsListToolSchema = Type.Object({
+  kinds: Type.Optional(Type.Array(Type.String())),     // 过滤 session 类型
+  limit: Type.Optional(Type.Number({ minimum: 1 })),
+  activeMinutes: Type.Optional(Type.Number()),         // 仅显示 N 分钟内活跃的 session
+  messageLimit: Type.Optional(Type.Number()),
+  label: Type.Optional(Type.String()),
+  includeDerivedTitles: Type.Optional(Type.Boolean()),
+  includeLastMessage: Type.Optional(Type.Boolean()),
+});
+```
+
+返回的每个 session entry 包含 `status` 字段：
+
+```typescript
+type SessionRunStatus = "running" | "done" | "failed" | "killed" | "timeout";
+```
+
+**coordinator 可在派发任务前先查询目标 agent 的 session 状态**，决定是否等待或选择其他 agent。
+
+### 10.4 `sessions_yield` 工具：让 Agent 主动让出控制
+
+源码: `src/agents/tools/sessions-yield-tool.ts`
+
+```typescript
+export function createSessionsYieldTool(opts?: {
+  sessionId?: string;
+  onYield?: (message: string) => Promise<void> | void;
+}): AnyAgentTool {
+  return {
+    name: "sessions_yield",
+    description: "End current turn. Use after spawning subagents; results arrive as next message.",
+    parameters: SessionsYieldToolSchema,
+    ...
+  };
+}
+```
+
+**关键用途**：orchestrator 在派发任务后调用 `sessions_yield`，主动结束当前 turn，这样：
+- 子 agent 的完成通知作为下一条消息到达
+- orchestrator 在等待期间不占用 Lane，可以响应其他消息
+
+### 10.5 `agent.wait` Gateway 方法：同步等待 Run 完成
+
+源码: `src/agents/run-wait.ts`
+
+```typescript
+export async function waitForAgentRun(params: {
+  runId: string;
+  timeoutMs: number;
+  callGateway?: GatewayCaller;
+}): Promise<AgentWaitResult> {
+  const wait = await callGateway({
+    method: "agent.wait",
+    params: { runId: params.runId, timeoutMs },
+    timeoutMs: timeoutMs + 2000,
+  });
+  // 返回: status: "ok" | "timeout" | "error" | "pending"
+}
+```
+
+`sessions_send` 内部使用此机制等待目标 agent 完成处理：
+- `timeoutSeconds > 0`: 同步等待，超时后返回 "accepted" 状态
+- `timeoutSeconds = 0`: fire-and-forget，不等待
+
+### 10.6 Lane Queue 和 Nested Lane
+
+源码: `src/agents/lanes.ts`
+
+```typescript
+export const AGENT_LANE_NESTED = CommandLane.Nested;
+export const AGENT_LANE_SUBAGENT = CommandLane.Subagent;
+
+export function resolveNestedAgentLaneForSession(sessionKey: string): string {
+  return `nested:${sessionKey}`;
+}
+```
+
+**关键设计**：`sessions_send` 将目标 agent 的工作放入 `nested:<targetSessionKey>` lane，而非主 lane。这意味着：
+- 子 agent 的工作不阻塞主 agent 的 Lane Queue
+- 多个子 session 的工作可以在各自的 nested lane 中并行
+
+### 10.7 推荐方案：保持子 Agent 随时响应
+
+#### 方案 1: 配置子 agent session 的 queueMode 为 "steer"
+
+```json
+{
+  "session": {
+    "defaults": {
+      "queueMode": "steer"
+    }
+  }
+}
+```
+
+或通过 `/queue steer` 指令在运行时切换。这让 coordinator 的新消息能立即注入正在运行的子 agent turn。
+
+#### 方案 2: fire-and-forget + sessions_yield 模式
+
+```
+Coordinator:
+  1. sessions_send(agentId="dev", message="实现登录模块", timeoutSeconds=0)
+  2. sessions_send(agentId="arch", message="评审方案", timeoutSeconds=0)
+  3. sessions_yield()  // 主动让出，等待子 agent 完成通知
+  
+  → 子 agent 完成后通过 A2A announce 回传结果
+  → coordinator 收到结果作为新 turn 的输入
+```
+
+#### 方案 3: 状态轮询 + 条件派发
+
+```
+Coordinator (在 SOUL.md 中指导):
+  1. sessions_list(activeMinutes=5) → 查看哪些 agent 空闲
+  2. 选择空闲的 agent 派发任务
+  3. 如果所有 agent 忙碌，排入内部任务队列等待
+```
+
+#### 方案对比
+
+| 方案 | 实时性 | 复杂度 | 适用场景 |
+|------|--------|--------|----------|
+| queueMode="steer" | 最高（立即注入） | 低 | 需要中断子 agent 的紧急指令 |
+| fire-and-forget + yield | 高（异步推送） | 中 | 正常任务派发，coordinator 需同时管理多任务 |
+| 状态轮询 + 条件派发 | 中 | 高 | 负载均衡，避免给忙碌 agent 加负荷 |
+
+## 十一、上下文的维护与跨 Session 共享
+
+### 11.1 上下文的层级结构
+
+OpenClaw 中的上下文分为多个层级，每个层级的共享范围不同：
+
+| 层级 | 存储位置 | 共享范围 | 内容示例 |
+|------|----------|----------|----------|
+| **Agent 级** (持久) | `agentDir/` 下的 Markdown 文件 | 同一 agent 的所有 session 共享 | SOUL.md, AGENTS.md, IDENTITY.md |
+| **Workspace 级** (项目) | 工作目录中的上下文文件 | 同一工作目录的所有 session 共享 | 项目 AGENTS.md, .openclaw/ 下文件 |
+| **Session 级** (对话) | JSONL transcript 文件 | 仅当前 session | 对话历史、工具调用结果 |
+| **Turn 级** (临时) | 内存中的 steering/followup 队列 | 仅当前 turn | 实时注入的上下文 |
+
+### 11.2 同一 Agent 的不同 Session 共享什么？
+
+源码: `src/agents/sessions/resource-loader.ts` 的 `loadProjectContextFiles()`
+
+```typescript
+export function loadProjectContextFiles(options: {
+  cwd: string;
+  agentDir: string;
+}): Array<{ path: string; content: string }> {
+  // 1. 加载 agentDir 下的全局上下文 (AGENTS.md / CLAUDE.md)
+  const globalContext = loadContextFileFromDir(resolvedAgentDir);
+  
+  // 2. 从 cwd 向上遍历所有祖先目录，收集 AGENTS.md
+  let currentDir = resolvedCwd;
+  while (true) {
+    const contextFile = loadContextFileFromDir(currentDir);
+    // ... 向上遍历到根目录
+  }
+  
+  return contextFiles;
+}
+```
+
+**同一 agent 的不同 session 共享的内容**：
+
+| 共享 | 不共享 |
+|------|--------|
+| SOUL.md (人格定义) | Session transcript (对话历史) |
+| AGENTS.md (操作指令) | Compaction summaries |
+| IDENTITY.md | Session-specific model/thinking overrides |
+| Skills (SKILL.md 文件) | queueMode, sendPolicy 等 session 设置 |
+| Extensions | 工具调用结果和中间状态 |
+| Memory 索引 (SQLite) | |
+
+**关键结论：所有 session 共享相同的 system prompt 基础 + 文件级上下文，但 transcript (对话记录) 完全隔离。**
+
+### 11.3 System Prompt 的组装过程
+
+源码: `src/agents/system-prompt.ts` 和 `src/agents/sessions/system-prompt.ts`
+
+每次 agent turn 开始时，system prompt 按以下顺序组装：
+
+```
+1. Base system prompt (硬编码的 agent 能力描述)
+2. Tool definitions (当前可用工具列表)
+3. Guidelines (行为准则)
+4. Context files — 按优先级排序:
+   - agents.md (优先级 10)
+   - soul.md (优先级 20)
+   - identity.md (优先级 30)
+   - user.md (优先级 40)
+   - tools.md (优先级 50)
+   - bootstrap.md (优先级 60)
+   - memory.md (优先级 70)
+5. Skills prompt (从 SKILL.md 文件生成)
+6. Append system prompt (额外注入)
+7. Sub-agent delegation section (如果是 orchestrator)
+8. Date + CWD
+```
+
+源码中的上下文文件优先级排序：
+
+```typescript
+// src/agents/system-prompt.ts
+const CONTEXT_FILE_ORDER = new Map<string, number>([
+  ["agents.md", 10],
+  ["soul.md", 20],
+  ["identity.md", 30],
+  ["user.md", 40],
+  ["tools.md", 50],
+  ["bootstrap.md", 60],
+  ["memory.md", 70],
+]);
+```
+
+### 11.4 Spawn-child Session 的上下文继承
+
+源码: `src/agents/embedded-agent-runner/run/attempt.spawn-workspace*.ts`
+
+当父 session spawn 子 session 时：
+
+```typescript
+// src/config/sessions/types.ts - SessionEntry
+{
+  spawnedBy?: string;             // 父 session key
+  spawnedWorkspaceDir?: string;   // 继承的工作目录
+  spawnedCwd?: string;            // 任务工作目录
+  inheritedToolDeny?: string[];   // 继承的工具禁止列表
+  inheritedToolAllow?: string[];  // 继承的工具允许列表
+}
+```
+
+**子 session 继承的上下文**：
+- 父 session 的工作目录 (`spawnedWorkspaceDir`) → 继承项目上下文文件
+- 工具权限列表 (allow/deny)
+- Agent 级别的所有文件 (SOUL.md, AGENTS.md 等)
+- Skills 配置
+
+**子 session 不继承的**：
+- 父 session 的 transcript（对话历史）
+- 父 session 的 model/thinking override
+- 父 session 的 compaction 状态
+
+### 11.5 Context Engine：跨 Session 的智能上下文管理
+
+源码: `src/context-engine/` 目录
+
+Context Engine 是 OpenClaw 的高级上下文管理系统：
+
+```typescript
+// src/context-engine/registry.ts
+export type ContextEngineFactoryContext = {
+  config?: OpenClawConfig;
+  agentDir?: string;
+  workspaceDir?: string;  // 工作目录级别的上下文
+};
+```
+
+Context Engine 的职责：
+- 管理 `workspaceDir` 级别的项目上下文
+- 在 turn 之间执行后台 maintenance（transcript 重写、优化）
+- 支持 thread_bootstrap 模式：一次性注入上下文到后端线程
+
+### 11.6 Memory 系统的跨 Session 共享
+
+源码: `extensions/memory-core/` 目录
+
+Memory-core 插件管理的记忆索引是 **agent 级别共享** 的：
+
+```typescript
+// memory-core 使用:
+resolveAgentDir()           // agent 目录 — 所有 session 共享
+resolveSessionTranscriptsDirForAgent()  // session 目录 — 索引所有 session 的 transcript
+```
+
+**Memory 共享模型**：
+- SQLite 向量索引: agent 级别，所有 session 的语义搜索共享同一个索引
+- Session transcript 索引: 定期从所有 session 的 JSONL 文件同步到索引
+- Memory 文件 (`/memory/` 目录): agent 级别共享
+
+### 11.7 团队协作中的上下文共享策略
+
+结合以上源码分析，针对飞书多 Agent 团队的上下文共享推荐：
+
+#### 项目上下文（全团队共享）
+
+```
+/shared-workspace/
+├── AGENTS.md              ← 全局项目指令（所有 agent 可读取）
+├── docs/requirements/     ← 需求文档
+├── docs/architecture/     ← 架构设计
+└── docs/status/           ← 项目状态
+```
+
+让所有 agent 的 `cwd` 指向同一个 `/shared-workspace/`，则所有 agent 自动共享：
+- 项目 AGENTS.md (上下文文件向上遍历机制)
+- 需求和设计文档 (通过 Skills 或 Memory 索引)
+
+#### 任务上下文（spawn-child 继承）
+
+```
+Coordinator spawn 子 session 时:
+  - spawnedWorkspaceDir = "/shared-workspace/"  (继承项目上下文)
+  - spawnedCwd = "/shared-workspace/tasks/TASK-001/"  (任务特定目录)
+  
+子 agent 在任务目录中可以读取:
+  - 任务描述文件 (TASK-001.md)
+  - 关联的设计文档
+  - 项目级 AGENTS.md
+```
+
+#### 状态上下文（sessions_list + Memory）
+
+```
+方式 1: sessions_list 实时查询
+  - coordinator 用 sessions_list 查看所有子 session 状态
+  - 获取: sessionKey, status, lastMessage, updatedAt
+
+方式 2: 文件系统状态文件
+  - 各 agent 将状态写入 /shared-workspace/status/<agentId>.md
+  - coordinator 通过 read 工具读取汇总
+
+方式 3: Memory 索引共享
+  - 所有 agent 共享同一 memory 索引
+  - agent 执行 memorySearch 可找到其他 agent 写入的知识
+```
+
+#### 不同 Session 间无法直接共享的内容
+
+| 内容类型 | 共享方式 | 原因 |
+|----------|----------|------|
+| 对话历史 | 不共享，设计如此 | session 隔离是核心安全特性 |
+| 工具执行结果 | 需通过 sessions_send 传递 | 结果绑定在特定 session transcript |
+| 中间推理过程 | 不共享 | 每个 session 的 compaction 独立 |
+| 决策结论 | 写入共享文件或 memory | 跨 session 的知识持久化 |
+
+### 11.8 Sub-Agent Delegation Mode
+
+源码: `src/agents/system-prompt.ts`
+
+```typescript
+function buildSubagentDelegationPreferenceSection(params: {
+  mode: SubagentDelegationMode;  // "prefer" | "suggest"
+  hasSessionsSpawn: boolean;
+  hasSubagents: boolean;
+  hasSessionsYield: boolean;
+}): string[] {
+  // mode="prefer" 时，system prompt 中注入以下指导:
+  // "You are the responsive coordinator for this conversation."
+  // "Anything requiring more work than a direct reply should go through sessions_spawn"
+  // "After spawning, call sessions_yield if you need completion events"
+}
+```
+
+**配置 coordinator 的 delegation mode 为 "prefer"**：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "subagents": {
+        "delegationMode": "prefer"
+      }
+    }
+  }
+}
+```
+
+这会在 system prompt 中自动注入 orchestrator 行为指导，让 coordinator：
+- 只直接回复简单问题
+- 所有需要工作的任务都通过 `sessions_spawn` 委派
+- 派发后调用 `sessions_yield` 等待结果
+- 子 agent 完成后以推送方式收到通知
+
+## 十二、历史子 Session 积累与检索问题
+
+### 12.1 问题描述
+
+使用 `sessions_spawn` 派生子 agent 时，随着使用会产生大量历史子 session：
+- 每个任务派发产生至少一个 spawn-child session
+- Session 使用 UUID 作为 sessionId，不具备语义可读性
+- Session store (`sessions.json`) 中的 entry 越来越多
+- 检索特定历史 session 时需要在全部记录中搜索
+
+### 12.2 OpenClaw 的自动治理机制（源码实证）
+
+源码: `src/config/sessions/store-maintenance.ts`
+
+OpenClaw 内建了三层自动治理：
+
+#### 第一层：时间淘汰 (pruneStaleEntries)
+
+```typescript
+const DEFAULT_SESSION_PRUNE_AFTER_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
+
+export function pruneStaleEntries(store, overrideMaxAgeMs?, opts?) {
+  const maxAgeMs = overrideMaxAgeMs ?? resolveMaintenanceConfigFromInput().pruneAfterMs;
+  const cutoffMs = Date.now() - maxAgeMs;
+  for (const [key, entry] of Object.entries(store)) {
+    if (shouldPreserveMaintenanceEntry({ key, entry, preserveKeys })) continue;
+    if (entry?.updatedAt != null && entry.updatedAt < cutoffMs) {
+      delete store[key]; // 超过 30 天的自动删除
+      pruned++;
+    }
+  }
+}
+```
+
+**关键发现**：subagent session 不在 "protected" 列表中：
+
+```typescript
+function isSyntheticSessionMaintenanceKey(sessionKey: string): boolean {
+  return (
+    isSubagentSessionKey(sessionKey) ||  // ← subagent session 是 "synthetic"
+    isAcpSessionKey(sessionKey) ||
+    isCronSessionKey(sessionKey) ||
+    ...
+  );
+}
+
+export function isProtectedSessionMaintenanceEntry(sessionKey, entry): boolean {
+  if (isSyntheticSessionMaintenanceKey(sessionKey)) return false; // ← 不受保护
+  // 只有 group/channel/thread 类型的 session 受保护
+  ...
+}
+```
+
+**结论：subagent (spawn-child) session 会被自动清理，它们不像群组 session 那样被"永久保护"。**
+
+#### 第二层：数量上限 (capEntryCount)
+
+```typescript
+const DEFAULT_SESSION_MAX_ENTRIES = 500;
+
+export function capEntryCount(store, overrideMax?, opts?) {
+  const maxEntries = overrideMax ?? resolveMaintenanceConfigFromInput().maxEntries;
+  // 按 updatedAt 降序排序，只保留最新的 maxEntries 个
+  const sorted = keys.toSorted((a, b) => getEntryUpdatedAt(store[b]) - getEntryUpdatedAt(store[a]));
+  const toRemove = sorted.slice(maxRemovableEntries);
+  for (const key of toRemove) {
+    delete store[key]; // 超出上限的自动删除
+  }
+}
+```
+
+**默认最多保留 500 个 session entry**。超出后按时间排序删除最旧的。
+
+#### 第三层：磁盘预算 (enforceSessionDiskBudget)
+
+源码: `src/config/sessions/disk-budget.ts`
+
+```typescript
+export async function enforceSessionDiskBudget(params: {
+  store: Record<string, SessionEntry>;
+  storePath: string;
+  maintenance: SessionDiskBudgetConfig; // { maxDiskBytes, highWaterBytes }
+  ...
+}): Promise<SessionDiskBudgetSweepResult | null> {
+  // 1. 统计 sessions 目录总大小
+  // 2. 超过 maxDiskBytes 时触发清理
+  // 3. 先删除孤立的 transcript 文件
+  // 4. 如果还超标，从 store 中删除最老的 entry + 对应 transcript
+  // 5. 清理到 highWaterBytes 以下为止
+}
+```
+
+### 12.3 Maintenance 触发时机
+
+源码: `src/config/sessions/store-maintenance.ts`
+
+```typescript
+export function shouldRunSessionEntryMaintenance(params: {
+  entryCount: number;
+  maxEntries: number;
+  force?: boolean;
+}): boolean {
+  if (params.force) return true;
+  // 当 entry 数量达到 maxEntries + slack 时触发 (非每次写入都触发)
+  return params.entryCount >= resolveSessionEntryMaintenanceHighWater(params.maxEntries);
+}
+
+export function resolveSessionEntryMaintenanceHighWater(maxEntries: number): number {
+  // maxEntries <= 49: 立即触发 (maxEntries + 1)
+  // maxEntries > 49:  批量触发 (maxEntries + max(25, 10%))
+  // 例: maxEntries=500 → 高水位=550，达到 550 时一次性清理到 500
+}
+```
+
+**不是每次 spawn 都触发清理**，而是积累到一定阈值后批量清理，减少 I/O 开销。
+
+### 12.4 配置优化建议
+
+```json
+{
+  "session": {
+    "maintenance": {
+      "mode": "enforce",
+      "pruneAfter": "7d",
+      "maxEntries": 200,
+      "maxDiskBytes": "100MB",
+      "resetArchiveRetention": "3d"
+    }
+  }
+}
+```
+
+| 配置项 | 默认值 | 建议值 | 说明 |
+|--------|--------|--------|------|
+| `pruneAfter` | 30d | 7d | 子 session 完成后 7 天即可清除 |
+| `maxEntries` | 500 | 200 | 减少检索范围 |
+| `maxDiskBytes` | 无限制 | 100MB | 磁盘预算，超出自动清理 |
+| `resetArchiveRetention` | 同 pruneAfter | 3d | reset 归档文件保留时间 |
+
+### 12.5 检索优化：避免在全量历史中搜索
+
+#### 方法 1: 使用 `taskName` 创建可预测的 session key
+
+源码: `src/agents/tools/sessions-spawn-tool.ts`
+
+```typescript
+const schema = {
+  task: Type.String(),
+  taskName: Type.Optional(Type.String({
+    description: "stable lowercase identifier for referencing this session later"
+  })),
+  label: Type.Optional(Type.String()),
+  ...
+};
+```
+
+spawn 时指定 `taskName`，session key 变为可预测格式：
+
+```
+sessions_spawn(task="实现登录模块", taskName="login_module")
+→ session key: agent:pm:subagent:login_module
+```
+
+之后可以直接用 key 检索，无需搜索：
+
+```
+sessions_send(sessionKey="agent:pm:subagent:login_module", message="进度如何？")
+```
+
+#### 方法 2: 使用 `label` 进行语义检索
+
+spawn 时设置 `label`，后续通过 `sessions_send(label="登录模块开发")` 查找：
+
+```
+sessions_spawn(task="...", label="登录模块开发-v1")
+```
+
+Gateway 的 `sessions.resolve` 方法支持按 label 查找：
+
+```typescript
+// sessions_send 内部使用:
+const resolved = await callGateway({
+  method: "sessions.resolve",
+  params: { label: labelParam, agentId: requestedAgentId },
+});
+```
+
+#### 方法 3: `sessions_list` 过滤参数
+
+```typescript
+const SessionsListToolSchema = Type.Object({
+  kinds: Type.Optional(Type.Array(Type.String())),  // 过滤类型，如 ["spawn-child"]
+  activeMinutes: Type.Optional(Type.Number()),       // 仅最近 N 分钟活跃的
+  label: Type.Optional(Type.String()),               // 按 label 匹配
+  agentId: Type.Optional(Type.String()),             // 按 agent 过滤
+  search: Type.Optional(Type.String()),              // 文本搜索
+  limit: Type.Optional(Type.Number()),               // 限制返回数量
+});
+```
+
+coordinator 可以精确查询：
+
+```
+sessions_list(kinds=["spawn-child"], activeMinutes=60, limit=10)
+→ 仅返回最近 1 小时内活跃的子 session
+```
+
+#### 方法 4: `spawnedBy` 过滤
+
+`SessionListRow` 包含 `spawnedBy` 字段：
+
+```typescript
+export type SessionListRow = {
+  key: string;
+  spawnedBy?: string;   // ← 可按父 session 过滤
+  label?: string;
+  displayName?: string;
+  status?: SessionRunStatus;
+  ...
+};
+```
+
+### 12.6 Session 生命周期管理策略
+
+针对飞书团队协作场景的推荐生命周期策略：
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Session 生命周期                                               │
+│                                                                  │
+│  spawn (创建)                                                    │
+│    ↓                                                             │
+│  running (执行中) ← sessions_send 交互                          │
+│    ↓                                                             │
+│  done/failed (完成/失败) — status 字段标记                       │
+│    ↓                                                             │
+│  idle (闲置) — updatedAt 不再更新                                │
+│    ↓  (7d 后)                                                    │
+│  pruned (自动清理) — store-maintenance 删除 entry + transcript   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**在 coordinator 的 SOUL.md 中指导**：
+
+```markdown
+## Task Session Management
+
+- Use `taskName` for all spawned sessions: `sessions_spawn(taskName="task_xxx")`
+- Use descriptive `label` for human-readable identification
+- After task completion, record key results to /shared-workspace/tasks/
+- Do NOT repeatedly query completed task sessions; read the task result file instead
+- For active task status, use `sessions_list(kinds=["spawn-child"], activeMinutes=30)`
+```
+
+### 12.7 长期方案：结果持久化而非 Session 持久化
+
+对于已完成的任务，核心问题不是"如何找到历史 session"，而是"如何保留任务结果"：
+
+```
+正确模式:
+  spawn-child session (短期，最终会被清理)
+    ↓ 任务完成时
+  结果写入 /shared-workspace/tasks/TASK-001-result.md (永久保留)
+    ↓ coordinator 汇总
+  用户 session transcript 中记录摘要 (永久保留在用户对话中)
+
+错误模式:
+  依赖历史 spawn-child session 作为任务记录存储
+  (这些 session 30 天后自动被清理)
+```
+
+### 12.8 源码中的保护机制总结
+
+| session 类型 | 是否受 maintenance 保护 | 清理行为 |
+|---|---|---|
+| 群组/频道 session (group/channel) | **受保护** | 不会被 prune 或 cap |
+| Thread session | **受保护** | 不会被 prune 或 cap |
+| Subagent session | 不受保护 | 30 天后 prune，超出 500 cap |
+| ACP session | 不受保护 | 同上 |
+| Cron session | 不受保护 | 同上 |
+| DM (direct) session | 不受保护 | 同上 |
+
 ## 学习记录
 
 | 日期 | 内容 | 来源 |
 |------|------|------|
 | 2026-05-26 | 从官方源码深入分析 session 机制、路由规则、agent 间通信工具 | github.com/openclaw/openclaw 源码 |
 | 2026-05-26 | 诊断 coordinator session 混杂问题，提出三种解决方案 | 源码分析 + 场景推演 |
+| 2026-05-26 | 补充：agent 忙碌时的响应延迟解决方案 (queueMode/yield/lanes) | 源码: queue-policy.ts, lanes.ts, sessions-yield-tool.ts |
+| 2026-05-26 | 补充：上下文层级模型和跨 session 共享机制 | 源码: resource-loader.ts, system-prompt.ts, context-engine/ |
+| 2026-05-26 | 补充：历史子 session 积累问题的自动治理机制和检索优化 | 源码: store-maintenance.ts, disk-budget.ts, sessions-spawn-tool.ts |
 
 ---
 
