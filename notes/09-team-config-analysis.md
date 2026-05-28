@@ -313,7 +313,7 @@ workspace-architect/project-context.md → /shared/project-context.md
   },
   agents: {
     defaults: {
-      workspace: "/home/camel/.openclaw/workspace",
+      workspace: "~/.openclaw/workspace",
       model: {
         primary: "deepseek/deepseek-v4-flash",
         fallbacks: ["deepseek/deepseek-v4"]
@@ -331,30 +331,30 @@ workspace-architect/project-context.md → /shared/project-context.md
       { id: "main" },
       {
         id: "pm",
-        workspace: "/home/camel/.openclaw/workspace-pm",
-        agentDir: "/home/camel/.openclaw/agents/pm/agent"
+        workspace: "~/.openclaw/workspace-pm",
+        agentDir: "~/.openclaw/agents/pm/agent"
         // PM 使用默认 flash 模型即可
       },
       {
         id: "architect",
-        workspace: "/home/camel/.openclaw/workspace-architect",
-        agentDir: "/home/camel/.openclaw/agents/architect/agent",
+        workspace: "~/.openclaw/workspace-architect",
+        agentDir: "~/.openclaw/agents/architect/agent",
         model: { primary: "deepseek/deepseek-v4" }  // 架构师需要深度推理
       },
       {
         id: "dev-front",
-        workspace: "/home/camel/.openclaw/workspace-dev-front",
-        agentDir: "/home/camel/.openclaw/agents/dev-front/agent"
+        workspace: "~/.openclaw/workspace-dev-front",
+        agentDir: "~/.openclaw/agents/dev-front/agent"
       },
       {
         id: "dev-backend",
-        workspace: "/home/camel/.openclaw/workspace-dev-backend",
-        agentDir: "/home/camel/.openclaw/agents/dev-backend/agent"
+        workspace: "~/.openclaw/workspace-dev-backend",
+        agentDir: "~/.openclaw/agents/dev-backend/agent"
       },
       {
         id: "reviewer",
-        workspace: "/home/camel/.openclaw/workspace-reviewer",
-        agentDir: "/home/camel/.openclaw/agents/reviewer/agent",
+        workspace: "~/.openclaw/workspace-reviewer",
+        agentDir: "~/.openclaw/agents/reviewer/agent",
         model: { primary: "deepseek/deepseek-v4" }  // 审查需要强理解力
       }
     ]
