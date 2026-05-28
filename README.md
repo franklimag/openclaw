@@ -52,7 +52,9 @@ Channels (50+) → Gateway (WebSocket:18789) → Agent Runtime (Pi Core) → Age
 │   ├── 03-memory.md           # 记忆系统 (SOUL/AGENTS/Activation-Decay)
 │   ├── 04-tools-skills.md     # Tools/Skills/Plugins (ClawHub/MCP/Browser)
 │   ├── 05-channels.md         # 消息通道 (50+ 平台/BlueBubbles/Voice)
-│   └── 06-security.md         # 安全机制 (攻击面/事件/加固)
+│   ├── 06-security.md         # 安全机制 (攻击面/事件/加固)
+│   ├── 07-team-setup.md       # 从零搭建 AI 开发团队 (飞书 Channel)
+│   └── 08-session-mechanism.md # Session 机制深度分析 (源码级，含通信隔离方案)
 ├── experiments/               # 实验代码/配置
 └── .kiro/steering/            # Kiro 工作约定
 ```
@@ -64,6 +66,7 @@ Channels (50+) → Gateway (WebSocket:18789) → Agent Runtime (Pi Core) → Age
 3. **阶段三**: 研究 Memory/SOUL 系统和 Activation/Decay
 4. **阶段四**: 了解 Skills/Plugins 开发和 ClawHub 生态
 5. **阶段五**: 跟踪安全事件和版本更新
+6. **阶段六**: 深入 Session 机制与多 Agent 通信设计（源码级分析）
 
 ## 相关链接
 
