@@ -2,6 +2,7 @@
 
 > 基于 `notes/08-session-mechanism.md` 中的源码级理解，对当前飞书 Agent 团队的实际配置进行分析。
 > 分析日期: 2026-05-28
+> **角色修正**: main (飞书应用 "assistant") 是团队协调者 (Coordinator)，pm 是产品经理负责需求管理。
 
 ---
 
@@ -34,7 +35,7 @@
 
 | 隐患 | 原因 | 影响 |
 |------|------|------|
-| **缺少 Coordinator** | 没有明确的协调者角色编排整体工作流 | 任务流转需要用户手动在不同应用间切换 |
+| **Coordinator 能力未激活** | main Agent 作为协调者，但未配置 delegation/spawn 能力 | 有协调者角色但缺少自动派发机制 |
 | **A2A 全开放** | `allow` 列表包含全部 Agent，无方向限制 | 任何 Agent 可向任何 Agent 发消息，缺乏管控 |
 | **dmScope 未配置** | 使用默认 `"main"`，所有 DM 共享一个 session | 同一用户与 pm 的所有对话都在一个 session 中 |
 | **无 session 维护配置** | 未配置 `session.maintenance` | 依赖默认值（500 条/30 天），可能不够积极 |
@@ -87,10 +88,9 @@
 ### 3.1 当前工作流（推测）
 
 ```
-用户 → 飞书私聊 pm → pm Agent 分析需求
-用户 → 手动切换到 architect 飞书应用 → architect 设计方案
-用户 → 手动切换到 dev-front 飞书应用 → dev-front 实现前端
-用户 → 手动切换到 reviewer 飞书应用 → reviewer 审查代码
+用户 → 飞书私聊 assistant(main) → main Agent 接收指令并协调
+用户 → 飞书私聊 pm → pm Agent 管理需求、拆解任务
+用户 → 可能手动切换到其他应用 → 各角色独立工作
 ```
 
 **问题**：用户需要手动充当协调者角色，在各个飞书应用间切换传递信息。
@@ -98,13 +98,14 @@
 ### 3.2 理想工作流（基于源码能力）
 
 ```
-用户 → 飞书私聊 pm → pm Agent 分析需求
-  pm → sessions_spawn(taskName="arch_review") → 派发给 architect
-  pm → sessions_yield() → 等待结果
-  architect 完成 → A2A announce 回传给 pm
-  pm → sessions_spawn(taskName="dev_impl") → 派发给 dev-front
+用户 → 飞书私聊 assistant(main) → main Agent 接收指令
+  main → sessions_send(agentId="pm", message="分析需求:...") → 让 PM 分析
+  main → sessions_send(agentId="architect", message="设计方案:...") → 让架构师设计
+  main → sessions_yield() → 等待回报
+  pm/architect 完成 → A2A announce 回传给 main
+  main → sessions_send(agentId="dev-front", ...) → 派发开发任务
   ...
-  pm → 向用户汇报最终结果
+  main → 向用户汇报最终结果
 ```
 
 ### 3.3 当前配置缺失的关键能力
@@ -380,37 +381,46 @@ workspace-architect/project-context.md → /shared/project-context.md
 
 ```
 当前:
-  用户 → 手动切换各飞书应用 → 各 Agent 独立工作 → 用户手动汇总
+  用户 → 飞书私聊 assistant(main) → main 协调 → A2A 通信各 Agent
+  用户 → 也可能直接私聊各角色应用 → 各 Agent 独立工作
+  问题: main 的协调能力未被充分配置，A2A 通信后 session 混杂
 
 目标:
-  用户 → 只与 PM 应用对话 → PM 自动派发给团队 → PM 汇总回报用户
+  用户 → 主要与 main(assistant) 对话 → main 自动派发/追踪/汇总
+  用户 → 也可直接与特定角色对话（专项讨论时）
+  main 的 session 中区分用户对话和团队回报
 ```
 
 ### 9.2 实施步骤
 
-**Step 1**: 在 PM 的 SOUL.md/AGENTS.md 中定义协调者行为：
+**Step 1**: 在 main 的 SOUL.md/AGENTS.md 中定义协调者行为：
 
 ```markdown
-# AGENTS.md (pm workspace)
+# AGENTS.md (main/assistant workspace)
+
+## Role
+你是团队协调者 (Coordinator)。用户通过飞书与你对话，你负责理解意图、分配任务、追踪进度、汇总结果。
 
 ## Team Members
+- pm: 产品经理，负责需求分析、优先级排序、验收标准定义
 - architect: 技术架构师，负责方案设计和技术决策
 - dev-front: 前端开发，负责 UI 实现
 - dev-backend: 后端开发，负责 API 和服务实现
 - reviewer: 代码审查，负责质量把关
 
 ## Workflow
-1. 收到用户需求 → 分析拆解为子任务
-2. 需要架构决策 → sessions_send(agentId="architect", ...)
-3. 需要前端实现 → sessions_send(agentId="dev-front", ...)
-4. 需要后端实现 → sessions_send(agentId="dev-backend", ...)
-5. 需要代码审查 → sessions_send(agentId="reviewer", ...)
-6. 收到回报 → 汇总后向用户报告
+1. 收到用户需求 → 判断需求清晰度
+2. 需求不清晰 → sessions_send(agentId="pm", ...) 让 PM 分析拆解
+3. 需要架构决策 → sessions_send(agentId="architect", ...)
+4. 需要实现 → sessions_send(agentId="dev-front/dev-backend", ...)
+5. 需要审查 → sessions_send(agentId="reviewer", ...)
+6. 收到 [Inter-session message] 回报 → 汇总后向用户报告
 
 ## Communication Rules
-- 与用户的对话：直接回复，使用结构化格式
-- 与团队的通信：使用 sessions_send，fire-and-forget 模式
-- 收到 [Inter-session message]：这是团队成员的回报，整合后再回复用户
+- 与用户的对话：直接回复，语气专业友好
+- 与团队的通信：使用 sessions_send，fire-and-forget 模式 (timeoutSeconds=0)
+- 收到 [Inter-session message]：这是团队成员的回报，不要原样转发给用户，要整合摘要
+- 用户询问进度时：使用 sessions_list(activeMinutes=30) 查看各 Agent 状态
 ```
 
 **Step 2**: 启用 `agentToAgent` + `subagents` 配置（如上节推荐配置）
@@ -427,9 +437,171 @@ PM 向用户汇总: "架构师的方案如下..."
 
 1. **sessions_send vs sessions_spawn**：当前配置下各 Agent 是独立的顶级 Agent（非子 agent），应使用 `sessions_send` 而非 `sessions_spawn`。`sessions_spawn` 适用于在同一 Agent 内派生子 session。
 
+   **补充**：main 作为 Coordinator 与其他 Agent（pm/architect/dev/reviewer）通信时使用 `sessions_send`。如果 main 自身内部需要做复杂的多步骤编排（如并行跟踪多个任务），可以在 main 内部使用 `sessions_spawn` 创建子 session 来隔离不同任务的上下文。
+
 2. **Session 混杂**：即使启用 A2A 通信，PM 的 session 中仍会收到 `[Inter-session message]` 前缀的回报。需要在 PM 的 SOUL.md 中明确指导如何处理这类消息。
 
 3. **并行派发**：PM 可以同时向多个 Agent 发送 `sessions_send(timeoutSeconds=0)`，但需要在 AGENTS.md 中指导 PM 如何跟踪和汇总多个异步回报。
+
+---
+
+## 十、团队角色定义与配置建议
+
+### 10.1 角色定位修正
+
+| Agent ID | 飞书应用 | 实际角色 | 职责定位 |
+|----------|----------|----------|----------|
+| `main` | assistant | **Coordinator (协调者)** | 接收用户指令，派发任务，追踪进度，汇总回报 |
+| `pm` | pm | Product Manager (产品经理) | 需求分析，优先级管理，任务拆解，验收标准 |
+| `architect` | architect | Architect (架构师) | 技术方案设计，架构评审，技术选型 |
+| `dev-front` | dev-front | Frontend Developer | 前端代码实现 |
+| `dev-backend` | dev-backend | Backend Developer | 后端代码实现 |
+| `reviewer` | reviewer | Code Reviewer | 代码质量审查，反馈改进意见 |
+
+### 10.2 main 与 pm 的职责边界
+
+main (Coordinator) 和 pm (Product Manager) 存在功能重叠区域，需要明确边界：
+
+| 职责 | main (Coordinator) | pm (Product Manager) |
+|------|-------------------|---------------------|
+| 与用户直接沟通 | ✅ 主要入口 | ✅ 需求讨论时直接对话 |
+| 理解用户意图 | ✅ 初步判断 | ✅ 深入需求分析 |
+| 任务拆解 | ❌ 不做细节拆解 | ✅ 核心职责 |
+| 派发到开发团队 | ✅ 分配给对应角色 | ❌ 通过 main 协调 |
+| 追踪任务进度 | ✅ 全局视图 | ✅ 需求维度追踪 |
+| 与架构师/开发沟通 | ✅ 转发和协调 | ✅ 需求澄清时直接沟通 |
+| 汇总结果给用户 | ✅ 核心职责 | ❌ 向 main 汇报 |
+
+**关键原则**：
+- 用户日常交互的主入口是 **main**
+- 需要深入需求讨论时，用户可直接与 **pm** 对话
+- pm 完成需求分析后，结果通过 A2A 回报给 main
+- main 负责后续的技术派发（不需要再经过 pm）
+
+### 10.3 两种协作模式
+
+#### 模式 A: main 全权协调（推荐起步）
+
+```
+用户 ↔ main (唯一入口)
+         ↓ sessions_send
+    pm / architect / dev-* / reviewer
+         ↓ A2A announce
+       main (汇总回报用户)
+```
+
+优势：用户只需与一个应用交互，体验最简单
+适合：日常任务派发、进度查询、结果汇总
+
+#### 模式 B: 用户可直接与角色对话
+
+```
+用户 ↔ main (协调)
+用户 ↔ pm (深入需求讨论)
+用户 ↔ architect (技术方案讨论)
+用户 ↔ reviewer (审查结果讨论)
+```
+
+优势：专项深入讨论时效率更高
+适合：需求变更澄清、架构方案选型讨论、审查意见交流
+
+**建议**：两种模式并存。main 处理大部分协调工作，但保留用户直接与专项角色对话的能力。
+
+### 10.4 Coordinator (main) 的完整配置建议
+
+#### SOUL.md
+
+```markdown
+# Soul - Coordinator
+
+## Identity
+你是开发团队的协调者。用户通过你与整个 AI 开发团队交互。
+
+## Personality
+- 高效、条理清晰
+- 善于分解复杂任务、分配到合适角色
+- 主动汇报进度，不让用户等待
+- 不亲自执行具体技术工作
+
+## Boundaries
+- 不写代码（交给 dev-front / dev-backend）
+- 不做架构决策（交给 architect）
+- 不做详细需求分析（交给 pm）
+- 不做代码审查（交给 reviewer）
+- 聚焦：协调、分配、追踪、汇总
+
+## Communication Style
+- 对用户：简洁明了，使用结构化格式
+- 对团队：清晰指令，明确交付标准
+- 收到回报：提炼关键信息，不原文转发
+```
+
+#### openclaw.json 中 main 相关配置
+
+```json5
+{
+  agents: {
+    defaults: {
+      subagents: {
+        maxSpawnDepth: 2,
+        delegationMode: "prefer"
+      }
+    }
+  },
+  tools: {
+    agentToAgent: {
+      enabled: true,
+      allow: ["main", "pm", "architect", "dev-front", "dev-backend", "reviewer"]
+    },
+    subagents: {
+      tools: {
+        alsoAllow: ["sessions_send"]
+      }
+    }
+  }
+}
+```
+
+### 10.5 A2A 通信方向建议
+
+```
+main → pm           ✅ (main 请求需求分析)
+main → architect    ✅ (main 请求方案设计)
+main → dev-front    ✅ (main 派发开发任务)
+main → dev-backend  ✅ (main 派发开发任务)
+main → reviewer     ✅ (main 请求代码审查)
+
+pm → main           ✅ (pm 回报需求分析结果)
+architect → main    ✅ (architect 回报方案)
+dev-front → main    ✅ (dev 回报开发完成)
+dev-backend → main  ✅ (dev 回报开发完成)
+reviewer → main     ✅ (reviewer 回报审查结果)
+
+pm → architect      ✅ (需求澄清时直接沟通)
+architect → dev-*   ✅ (技术指导)
+reviewer → dev-*    ✅ (审查反馈)
+
+dev-* → dev-*       ❌ (开发之间不直接通信，通过 main 协调)
+dev-* → pm          ❌ (需求问题通过 main 转发)
+```
+
+### 10.6 关于 sessions_send vs sessions_spawn 的选择
+
+在当前架构中：
+
+| 场景 | 推荐工具 | 原因 |
+|------|----------|------|
+| main → pm/architect/dev/reviewer | `sessions_send` | 跨 Agent 通信，各 Agent 是独立顶级实例 |
+| main 内部复杂任务编排 | `sessions_spawn` | 同一 Agent 内派生子 session，隔离不同任务上下文 |
+| pm 内部多步需求分析 | `sessions_spawn` (在 pm 内部) | pm 自己内部的任务分解 |
+
+**核心区别**：
+- `sessions_send`: 给**另一个 Agent** 发消息（跨 agent，各自有独立 workspace）
+- `sessions_spawn`: 在**自己内部**创建子 session（同一 agent，共享 workspace）
+
+当前配置的各角色是独立 Agent，所以 main 协调时应使用 `sessions_send`。
+
+如果未来 main 需要同时跟踪多个并行任务且避免 session 混杂，可以在 main 内部使用 `sessions_spawn` 为每个任务创建独立子 session，在子 session 中执行 `sessions_send` 与其他 Agent 通信。
 
 ---
 
@@ -438,6 +610,7 @@ PM 向用户汇总: "架构师的方案如下..."
 | 日期 | 内容 | 来源 |
 |------|------|------|
 | 2026-05-28 | 分析真实团队配置，对照源码级 session 机制给出改进建议 | 实际配置 + 源码分析 |
+| 2026-05-28 | 修正角色定位(main=Coordinator, pm=PM)，给出协调者配置和团队协作建议 | 用户反馈 + 配置分析 |
 
 ---
 
